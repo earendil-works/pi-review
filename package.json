@@ -1,0 +1,35 @@
+{
+  "name": "pi-review-extension",
+  "version": "0.1.0",
+  "description": "Standalone /review extension for pi coding agent",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./review.ts",
+      "default": "./review.ts"
+    }
+  },
+  "types": "./review.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./review.ts"
+    ]
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
