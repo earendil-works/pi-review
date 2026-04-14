@@ -1,5 +1,5 @@
 {
-  "name": "pi-review-extension",
+  "name": "@earendil-works/pi-review",
   "version": "0.1.0",
   "description": "Standalone /review extension for pi coding agent",
   "type": "module",
