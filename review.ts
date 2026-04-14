@@ -134,7 +134,8 @@ type ReviewTarget =
 	| { type: "baseBranch"; branch: string }
 	| { type: "commit"; sha: string; title?: string }
 	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
-	| { type: "folder"; paths: string[] };
+	| { type: "folder"; paths: string[] }
+	| { type: "jjdiff"; args?: string[] };
 
 // Prompts (adapted from Codex)
 const UNCOMMITTED_PROMPT =
@@ -159,6 +160,9 @@ const PULL_REQUEST_PROMPT_FALLBACK =
 
 const FOLDER_REVIEW_PROMPT =
 	"Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
+
+const JJDIFF_PROMPT =
+	"Review the changes in output from `jj diff --git{args}` and provide prioritized, actionable findings.";
 
 // The detailed review rubric (adapted from Codex's review_prompt.md)
 const REVIEW_RUBRIC = `# Review Guidelines
@@ -512,6 +516,11 @@ async function buildReviewPrompt(
 
 		case "folder":
 			return FOLDER_REVIEW_PROMPT.replace("{paths}", target.paths.join(", "));
+
+		case "jjdiff": {
+			const args = target.args?.length ? ` ${target.args.map(arg => JSON.stringify(arg)).join(" ")}` : "";
+			return JJDIFF_PROMPT.replace("{args}", args);
+		}
 	}
 }
 
@@ -537,6 +546,11 @@ function getUserFacingHint(target: ReviewTarget): string {
 		case "folder": {
 			const joined = target.paths.join(", ");
 			return joined.length > 40 ? `folders: ${joined.slice(0, 37)}...` : `folders: ${joined}`;
+		}
+
+		case "jjdiff": {
+			const args = target.args?.join(" ") || "";
+			return args ? `jj diff ${args}` : "jj diff";
 		}
 	}
 }
@@ -1282,6 +1296,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				return { target: { type: "pr", ref }, extraInstruction };
 			}
 
+			case "jjdiff": {
+				const args = parts.slice(1);
+				return { target: { type: "jjdiff", args: args.length > 0 ? args : undefined }, extraInstruction };
+			}
+
 			default:
 				return { target: null, extraInstruction };
 		}
@@ -1296,7 +1315,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 	// Register the /review command
 	pi.registerCommand("review", {
-		description: "Review code changes (PR, uncommitted, branch, commit, or folder)",
+		description: "Review code changes (PR, uncommitted, branch, commit, folder, or jjdiff)",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
