@@ -19,7 +19,7 @@ pi install git:github.com/earendil-works/pi-review
 - Produce prioritized findings with a clear verdict and actionable follow-ups
 - It separates feedback to the agent from human callouts
 
-It also supports cusotm shared instructions that are loaded from `REVIEW_GUIDELINES.md`.
+It also supports custom shared instructions that are loaded from `REVIEW_GUIDELINES.md`.
 
 ## Quick usage
 
