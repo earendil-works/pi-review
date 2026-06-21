@@ -3,7 +3,7 @@
  *
  * Provides a `/review` command that prompts the agent to review code changes.
  * Supports multiple review modes:
- * - Review a GitHub pull request (checks out the PR locally)
+ * - Review a GitHub pull request or GitLab merge request (checks it out locally)
  * - Review against a base branch (PR style)
  * - Review uncommitted changes
  * - Review a specific commit
@@ -13,6 +13,8 @@
  * - `/review` - show interactive selector
  * - `/review pr 123` - review PR #123 (checks out locally)
  * - `/review pr https://github.com/owner/repo/pull/123` - review PR from URL
+ * - `/review mr 123` - review MR #123 (checks out locally)
+ * - `/review mr https://gitlab.com/owner/repo/-/merge_requests/123` - review MR from URL
  * - `/review uncommitted` - review uncommitted changes directly
  * - `/review branch main` - review against main branch
  * - `/review commit abc123` - review specific commit
@@ -24,7 +26,7 @@
  * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
  *   its contents are appended to the review prompt.
  *
- * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
+ * Note: PR/MR review requires a clean working tree (no uncommitted changes to tracked files).
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -53,8 +55,10 @@ const REVIEW_ANCHOR_TYPE = "review-anchor";
 const REVIEW_SETTINGS_TYPE = "review-settings";
 const GH_SETUP_INSTRUCTIONS =
 	"Install GitHub CLI (`gh`) from https://cli.github.com/ (macOS: `brew install gh`), then sign in with `gh auth login` and verify with `gh auth status`.";
+const GLAB_SETUP_INSTRUCTIONS =
+	"Install GitLab CLI (`glab`) from https://gitlab.com/gitlab-org/cli, then sign in with `glab auth login` and verify with `glab auth status`.";
 const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
-	"Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.";
+	"Cannot checkout PR/MR: you have uncommitted changes. Please commit or stash them first.";
 
 type ReviewSessionState = {
 	active: boolean;
@@ -63,6 +67,15 @@ type ReviewSessionState = {
 
 type ReviewSettingsState = {
 	customInstructions?: string;
+};
+
+type PullRequestProvider = "github" | "gitlab";
+
+type PullRequestRef = {
+	provider: PullRequestProvider;
+	number: number;
+	ref: string;
+	repo?: string;
 };
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
@@ -133,7 +146,7 @@ type ReviewTarget =
 	| { type: "uncommitted" }
 	| { type: "baseBranch"; branch: string }
 	| { type: "commit"; sha: string; title?: string }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
+	| { type: "pullRequest"; provider: PullRequestProvider; prNumber: number; baseBranch: string; title: string }
 	| { type: "folder"; paths: string[] };
 
 // Prompts (adapted from Codex)
@@ -152,10 +165,10 @@ const COMMIT_PROMPT_WITH_TITLE =
 const COMMIT_PROMPT = "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.";
 
 const PULL_REQUEST_PROMPT =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
+	'Review {targetKind} #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
 
 const PULL_REQUEST_PROMPT_FALLBACK =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
+	'Review {targetKind} #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
 
 const FOLDER_REVIEW_PROMPT =
 	"Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
@@ -392,34 +405,89 @@ async function hasPendingChanges(pi: ExtensionAPI): Promise<boolean> {
 }
 
 /**
- * Parse a PR reference (URL or number) and return the PR number
+ * Parse a PR/MR reference (URL or number) and return provider metadata
  */
-function parsePrReference(ref: string): number | null {
+function getGitlabHostname(repo: string | undefined): string | undefined {
+	return repo?.match(/^(?:https?:\/\/)?([^/\s]+)/)?.[1];
+}
+
+function normalizeGitlabUrl(value: string): string {
+	return /^https?:\/\//.test(value) ? value : `https://${value}`;
+}
+
+function parsePrReference(ref: string, defaultProvider: PullRequestProvider = "github"): PullRequestRef | null {
 	const trimmed = ref.trim();
 
 	// Try as a number first
 	const num = parseInt(trimmed, 10);
 	if (!isNaN(num) && num > 0) {
-		return num;
+		return { provider: defaultProvider, number: num, ref: trimmed };
 	}
 
 	// Try to extract from GitHub URL
 	// Formats: https://github.com/owner/repo/pull/123
 	//          github.com/owner/repo/pull/123
-	const urlMatch = trimmed.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
-	if (urlMatch) {
-		return parseInt(urlMatch[1], 10);
+	const githubUrlMatch = trimmed.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
+	if (githubUrlMatch) {
+		return { provider: "github", number: parseInt(githubUrlMatch[1], 10), ref: trimmed };
+	}
+
+	// Try to extract from GitLab URL
+	// Formats: https://gitlab.com/owner/repo/-/merge_requests/123
+	//          gitlab.com/owner/repo/-/merge_requests/123
+	const gitlabUrlMatch = trimmed.match(/((?:https?:\/\/)?[^/\s]+\/.+?)\/-\/merge_requests\/(\d+)(?:[/?#].*)?$/);
+	if (gitlabUrlMatch) {
+		return {
+			provider: "gitlab",
+			number: parseInt(gitlabUrlMatch[2], 10),
+			ref: normalizeGitlabUrl(trimmed),
+			repo: normalizeGitlabUrl(gitlabUrlMatch[1]),
+		};
 	}
 
 	return null;
 }
 
 /**
- * Get PR information from GitHub CLI
+ * Get PR/MR information from the provider CLI
  */
-async function getPrInfo(pi: ExtensionAPI, prNumber: number): Promise<{ baseBranch: string; title: string; headBranch: string } | null> {
+async function getPrInfo(pi: ExtensionAPI, prRef: PullRequestRef): Promise<{ baseBranch: string; title: string; headBranch: string } | null> {
+	if (prRef.provider === "gitlab") {
+		const args = ["mr", "view", String(prRef.number), "--output", "json"];
+		if (prRef.repo) {
+			args.push("-R", prRef.repo);
+		}
+
+		const { stdout, code } = await pi.exec("glab", args);
+		if (code !== 0) return null;
+
+		let data: unknown;
+		try {
+			data = JSON.parse(stdout);
+		} catch (error) {
+			throw new Error(`Failed to parse glab MR JSON output: ${error instanceof Error ? error.message : String(error)}`);
+		}
+
+		if (
+			!data ||
+			typeof data !== "object" ||
+			typeof (data as { target_branch?: unknown }).target_branch !== "string" ||
+			typeof (data as { title?: unknown }).title !== "string" ||
+			typeof (data as { source_branch?: unknown }).source_branch !== "string"
+		) {
+			throw new Error("Unexpected glab MR JSON output: missing target_branch, title, or source_branch");
+		}
+
+		const mrData = data as { target_branch: string; title: string; source_branch: string };
+		return {
+			baseBranch: mrData.target_branch,
+			title: mrData.title,
+			headBranch: mrData.source_branch,
+		};
+	}
+
 	const { stdout, code } = await pi.exec("gh", [
-		"pr", "view", String(prNumber),
+		"pr", "view", String(prRef.number),
 		"--json", "baseRefName,title,headRefName",
 	]);
 
@@ -438,13 +506,16 @@ async function getPrInfo(pi: ExtensionAPI, prNumber: number): Promise<{ baseBran
 }
 
 /**
- * Checkout a PR using GitHub CLI
+ * Checkout a PR/MR using the provider CLI
  */
-async function checkoutPr(pi: ExtensionAPI, prNumber: number): Promise<{ success: boolean; error?: string }> {
-	const { stdout, stderr, code } = await pi.exec("gh", ["pr", "checkout", String(prNumber)]);
+async function checkoutPr(pi: ExtensionAPI, prRef: PullRequestRef): Promise<{ success: boolean; error?: string }> {
+	const checkoutRef = prRef.provider === "gitlab" ? prRef.ref : String(prRef.number);
+	const { stdout, stderr, code } = prRef.provider === "gitlab"
+		? await pi.exec("glab", ["mr", "checkout", checkoutRef])
+		: await pi.exec("gh", ["pr", "checkout", checkoutRef]);
 
 	if (code !== 0) {
-		return { success: false, error: stderr || stdout || "Failed to checkout PR" };
+		return { success: false, error: stderr || stdout || "Failed to checkout PR/MR" };
 	}
 
 	return { success: true };
@@ -506,13 +577,16 @@ async function buildReviewPrompt(
 
 		case "pullRequest": {
 			const mergeBase = await getMergeBase(pi, target.baseBranch);
+			const targetKind = target.provider === "gitlab" ? "merge request" : "pull request";
 			const basePrompt = mergeBase
 				? PULL_REQUEST_PROMPT
+						.replace(/{targetKind}/g, targetKind)
 						.replace(/{prNumber}/g, String(target.prNumber))
 						.replace(/{title}/g, target.title)
 						.replace(/{baseBranch}/g, target.baseBranch)
 						.replace(/{mergeBaseSha}/g, mergeBase)
 				: PULL_REQUEST_PROMPT_FALLBACK
+						.replace(/{targetKind}/g, targetKind)
 						.replace(/{prNumber}/g, String(target.prNumber))
 						.replace(/{title}/g, target.title)
 						.replace(/{baseBranch}/g, target.baseBranch);
@@ -540,7 +614,8 @@ function getUserFacingHint(target: ReviewTarget): string {
 
 		case "pullRequest": {
 			const shortTitle = target.title.length > 30 ? target.title.slice(0, 27) + "..." : target.title;
-			return `PR #${target.prNumber}: ${shortTitle}`;
+			const label = target.provider === "gitlab" ? "MR" : "PR";
+			return `${label} #${target.prNumber}: ${shortTitle}`;
 		}
 
 		case "folder": {
@@ -555,7 +630,7 @@ const REVIEW_PRESETS = [
 	{ value: "uncommitted", label: "Review uncommitted changes", description: "" },
 	{ value: "baseBranch", label: "Review against a base branch", description: "(local)" },
 	{ value: "commit", label: "Review a commit", description: "" },
-	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
+	{ value: "pullRequest", label: "Review a pull/merge request", description: "(GitHub PR / GitLab MR)" },
 	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
 ] as const;
 
@@ -600,12 +675,44 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
+	async function ensureGitlabCliReady(ctx: ExtensionContext, prRef: PullRequestRef): Promise<boolean> {
+		const glabVersion = await pi.exec("glab", ["--version"]);
+		if (glabVersion.code !== 0) {
+			ctx.ui.notify(`MR review requires GitLab CLI (\`glab\`). ${GLAB_SETUP_INSTRUCTIONS}`, "error");
+			return false;
+		}
+
+		const hostname = getGitlabHostname(prRef.repo);
+		const authArgs = hostname ? ["auth", "status", "--hostname", hostname] : ["auth", "status"];
+		const authCommand = hostname ? `glab auth status --hostname ${hostname}` : "glab auth status";
+		const glabAuthStatus = await pi.exec("glab", authArgs);
+		if (glabAuthStatus.code !== 0) {
+			ctx.ui.notify(
+				`GitLab CLI is installed, but you're not signed in. Run \`glab auth login\`, then verify with \`${authCommand}\`.`,
+				"error",
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	async function ensureReviewCliReady(ctx: ExtensionContext, prRef: PullRequestRef): Promise<boolean> {
+		return prRef.provider === "gitlab" ? await ensureGitlabCliReady(ctx, prRef) : await ensureGithubCliReady(ctx);
+	}
+
 	async function resolvePullRequestTarget(
 		ctx: ExtensionContext,
 		ref: string,
-		options: { skipInitialPendingChangesCheck?: boolean } = {},
+		options: { skipInitialPendingChangesCheck?: boolean; defaultProvider?: PullRequestProvider } = {},
 	): Promise<ReviewTarget | null> {
-		if (!(await ensureGithubCliReady(ctx))) {
+		const prRef = parsePrReference(ref, options.defaultProvider ?? "github");
+		if (!prRef) {
+			ctx.ui.notify("Invalid PR/MR reference. Enter a number, GitHub PR URL, or GitLab MR URL.", "error");
+			return null;
+		}
+
+		if (!(await ensureReviewCliReady(ctx, prRef))) {
 			return null;
 		}
 
@@ -614,18 +721,21 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return null;
 		}
 
-		const prNumber = parsePrReference(ref);
-		if (!prNumber) {
-			ctx.ui.notify("Invalid PR reference. Enter a number or GitHub PR URL.", "error");
+		const label = prRef.provider === "gitlab" ? "MR" : "PR";
+		const authCommand = prRef.provider === "gitlab" ? "glab auth status" : "gh auth status";
+
+		ctx.ui.notify(`Fetching ${label} #${prRef.number} info...`, "info");
+		let prInfo: { baseBranch: string; title: string; headBranch: string } | null;
+		try {
+			prInfo = await getPrInfo(pi, prRef);
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			return null;
 		}
 
-		ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-		const prInfo = await getPrInfo(pi, prNumber);
-
 		if (!prInfo) {
 			ctx.ui.notify(
-				`Could not fetch PR #${prNumber}. Make sure it exists and your GitHub auth has access (check with \`gh auth status\`).`,
+				`Could not fetch ${label} #${prRef.number}. Make sure it exists and your auth has access (check with \`${authCommand}\`).`,
 				"error",
 			);
 			return null;
@@ -637,19 +747,20 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return null;
 		}
 
-		ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-		const checkoutResult = await checkoutPr(pi, prNumber);
+		ctx.ui.notify(`Checking out ${label} #${prRef.number}...`, "info");
+		const checkoutResult = await checkoutPr(pi, prRef);
 
 		if (!checkoutResult.success) {
-			ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
+			ctx.ui.notify(`Failed to checkout ${label}: ${checkoutResult.error}`, "error");
 			return null;
 		}
 
-		ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
+		ctx.ui.notify(`Checked out ${label} #${prRef.number} (${prInfo.headBranch})`, "info");
 
 		return {
 			type: "pullRequest",
-			prNumber,
+			provider: prRef.provider,
+			prNumber: prRef.number,
 			baseBranch: prInfo.baseBranch,
 			title: prInfo.title,
 		};
@@ -1067,7 +1178,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 		// Get PR reference from user
 		const prRef = await ctx.ui.editor(
-			"Enter PR number or URL (e.g. 123 or https://github.com/owner/repo/pull/123):",
+			"Enter GitHub PR number/URL or GitLab MR URL (e.g. 123, https://github.com/owner/repo/pull/123, or https://gitlab.com/owner/repo/-/merge_requests/123):",
 			"",
 		);
 
@@ -1178,7 +1289,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	 * Returns the target or a special marker for PR that needs async handling
 	 */
 	type ParsedReviewArgs = {
-		target: ReviewTarget | { type: "pr"; ref: string } | null;
+		target: ReviewTarget | { type: "pr"; ref: string; defaultProvider: PullRequestProvider } | null;
 		extraInstruction?: string;
 		error?: string;
 	};
@@ -1288,7 +1399,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			case "pr": {
 				const ref = parts[1];
 				if (!ref) return { target: null, extraInstruction };
-				return { target: { type: "pr", ref }, extraInstruction };
+				return { target: { type: "pr", ref, defaultProvider: "github" }, extraInstruction };
+			}
+
+			case "mr": {
+				const ref = parts[1];
+				if (!ref) return { target: null, extraInstruction };
+				return { target: { type: "pr", ref, defaultProvider: "gitlab" }, extraInstruction };
 			}
 
 			default:
@@ -1299,13 +1416,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	/**
 	 * Handle PR checkout and return a ReviewTarget (or null on failure)
 	 */
-	async function handlePrCheckout(ctx: ExtensionContext, ref: string): Promise<ReviewTarget | null> {
-		return await resolvePullRequestTarget(ctx, ref);
+	async function handlePrCheckout(ctx: ExtensionContext, ref: string, defaultProvider: PullRequestProvider): Promise<ReviewTarget | null> {
+		return await resolvePullRequestTarget(ctx, ref, { defaultProvider });
 	}
 
 	// Register the /review command
 	pi.registerCommand("review", {
-		description: "Review code changes (PR, uncommitted, branch, commit, or folder)",
+		description: "Review code changes (PR/MR, uncommitted, branch, commit, or folder)",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
@@ -1338,10 +1455,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 			if (parsed.target) {
 				if (parsed.target.type === "pr") {
-					// Handle PR checkout (async operation)
-					target = await handlePrCheckout(ctx, parsed.target.ref);
+					// Handle PR/MR checkout (async operation)
+					target = await handlePrCheckout(ctx, parsed.target.ref, parsed.target.defaultProvider);
 					if (!target) {
-						ctx.ui.notify("PR review failed. Returning to review menu.", "warning");
+						ctx.ui.notify("PR/MR review failed. Returning to review menu.", "warning");
 					}
 				} else {
 					target = parsed.target;
