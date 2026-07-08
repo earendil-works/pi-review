@@ -296,6 +296,34 @@ async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> 
 	}
 }
 
+function formatPromptPath(value: string): string {
+	return value.split(path.sep).join("/");
+}
+
+async function buildRepositoryPathContext(pi: ExtensionAPI, cwd: string): Promise<string | null> {
+	try {
+		const { stdout, code } = await pi.exec("git", ["rev-parse", "--show-toplevel"]);
+		if (code !== 0) return null;
+
+		const repoRoot = stdout.trim();
+		if (!repoRoot) return null;
+
+		const currentDir = await fs.realpath(cwd).catch(() => path.resolve(cwd));
+		const rootDir = await fs.realpath(repoRoot).catch(() => path.resolve(repoRoot));
+		const relativeCurrentDir = path.relative(rootDir, currentDir);
+
+		if (!relativeCurrentDir || relativeCurrentDir.startsWith("..") || path.isAbsolute(relativeCurrentDir)) {
+			return null;
+		}
+
+		const displaySubdir = formatPromptPath(relativeCurrentDir);
+
+		return `Keep in mind that \`git diff\` shows paths relative to the repository root, but Pi is running in the \`${displaySubdir}\` subdirectory. For file paths you use afterward, make them relative to this subdirectory.`;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Get the merge base between HEAD and a branch
  */
@@ -1140,9 +1168,14 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		const prompt = await buildReviewPrompt(pi, target);
 		const hint = getUserFacingHint(target);
 		const projectGuidelines = await loadProjectReviewGuidelines(ctx.cwd);
+		const repositoryPathContext = await buildRepositoryPathContext(pi, ctx.cwd);
 
 		// Combine the review rubric with the specific prompt
 		let fullPrompt = `${REVIEW_RUBRIC}\n\n---\n\nPlease perform a code review with the following focus:\n\n${prompt}`;
+
+		if (repositoryPathContext) {
+			fullPrompt += `\n\n${repositoryPathContext}`;
+		}
 
 		if (reviewCustomInstructions) {
 			fullPrompt += `\n\nShared custom review instructions (applies to all reviews):\n\n${reviewCustomInstructions}`;
