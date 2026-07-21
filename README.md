@@ -3,6 +3,12 @@
 `pi-review` adds a practical code review workflow to Pi via `/review` and `/end-review`
 that is used by us at Earendil.
 
+Unlike a one-shot review prompt, it creates a dedicated review mode where you can stay
+focused on the review itself: inspect findings, ask follow-up questions, challenge false
+positives, and tell the agent how you want to handle the issues it found. When you are
+done, `/end-review` can take you back to where you started, summarize the review, or
+queue follow-up work to fix the findings you agreed on.
+
 ## Install
 
 ```bash
@@ -11,6 +17,8 @@ pi install git:github.com/earendil-works/pi-review
 
 ## What It Does
 
+- Create a dedicated **review mode** that keeps review discussion separate from regular work
+- Let you **talk through findings with the agent** before deciding what should happen next
 - Review **uncommitted changes**
 - Review changes against a **base branch**
 - Review a specific **commit**
@@ -40,4 +48,8 @@ When a review session is active, finish it with:
 /end-review
 ```
 
-You can then return only, return + summarize, or return + queue fixing work.
+At that point you can:
+
+- **Return only** to go back to your original position
+- **Return and summarize** to bring the review conclusions back with you
+- **Return and fix findings** to queue follow-up work based on the review discussion
