@@ -425,25 +425,63 @@ function parsePrReference(ref: string): number | null {
 async function getPrInfo(
 	pi: ExtensionAPI,
 	prNumber: number,
-): Promise<{ baseBranch: string; title: string; headBranch: string; headRefOid: string } | null> {
+): Promise<{
+	baseBranch: string;
+	title: string;
+	headBranch: string;
+	headRefOid: string;
+	baseRepository: string;
+	baseRepositoryUrl: string;
+} | null> {
 	const { stdout, code } = await pi.exec("gh", [
 		"pr", "view", String(prNumber),
-		"--json", "baseRefName,title,headRefName,headRefOid",
+		"--json", "baseRefName,title,headRefName,headRefOid,url",
 	]);
 
 	if (code !== 0) return null;
 
 	try {
 		const data = JSON.parse(stdout);
+		const prUrl = new URL(data.url);
+		const repositoryMatch = prUrl.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/\d+\/?$/);
+		if (!repositoryMatch) return null;
+
+		const baseRepository = repositoryMatch[1];
 		return {
 			baseBranch: data.baseRefName,
 			title: data.title,
 			headBranch: data.headRefName,
 			headRefOid: data.headRefOid,
+			baseRepository,
+			baseRepositoryUrl: `${prUrl.origin}/${baseRepository}.git`,
 		};
 	} catch {
 		return null;
 	}
+}
+
+function remoteMatchesRepository(remoteUrl: string, repository: string): boolean {
+	const normalizedUrl = remoteUrl.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+	return normalizedUrl.endsWith(`/${repository}`) || normalizedUrl.endsWith(`:${repository}`);
+}
+
+async function getPrFetchRemote(
+	pi: ExtensionAPI,
+	repoRoot: string,
+	baseRepository: string,
+	baseRepositoryUrl: string,
+): Promise<string> {
+	const remotes = await pi.exec("git", ["remote", "-v"], { cwd: repoRoot });
+	if (remotes.code === 0) {
+		for (const line of remotes.stdout.split("\n")) {
+			const match = line.match(/^(\S+)\s+(\S+)\s+\(fetch\)$/);
+			if (match && remoteMatchesRepository(match[2], baseRepository)) {
+				return match[1];
+			}
+		}
+	}
+
+	return baseRepositoryUrl;
 }
 
 async function getGitRoot(pi: ExtensionAPI): Promise<string | null> {
@@ -458,6 +496,8 @@ async function createPrWorktree(
 	pi: ExtensionAPI,
 	prNumber: number,
 	headRefOid: string,
+	baseRepository: string,
+	baseRepositoryUrl: string,
 ): Promise<{ success: boolean; worktreePath?: string; error?: string }> {
 	const repoRoot = await getGitRoot(pi);
 	if (!repoRoot) {
@@ -476,9 +516,10 @@ async function createPrWorktree(
 
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
+	const fetchRemote = await getPrFetchRemote(pi, repoRoot, baseRepository, baseRepositoryUrl);
 	const fetchResult = await pi.exec(
 		"git",
-		["fetch", "--no-tags", "origin", `pull/${prNumber}/head`],
+		["fetch", "--no-tags", fetchRemote, `pull/${prNumber}/head`],
 		{ cwd: repoRoot },
 	);
 	if (fetchResult.code !== 0) {
@@ -713,7 +754,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		}
 
 		ctx.ui.notify(`Checking out PR #${prNumber} in a worktree...`, "info");
-		const worktreeResult = await createPrWorktree(pi, prNumber, prInfo.headRefOid);
+		const worktreeResult = await createPrWorktree(
+			pi,
+			prNumber,
+			prInfo.headRefOid,
+			prInfo.baseRepository,
+			prInfo.baseRepositoryUrl,
+		);
 
 		if (!worktreeResult.success || !worktreeResult.worktreePath) {
 			ctx.ui.notify(`Failed to checkout PR: ${worktreeResult.error}`, "error");
@@ -754,9 +801,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			isToolCallEventType("find", event) ||
 			isToolCallEventType("ls", event)
 		) {
-			if (event.input.path) {
-				event.input.path = mapReviewPath(event.input.path, ctx.cwd, worktreePath);
-			}
+			event.input.path = event.input.path
+				? mapReviewPath(event.input.path, ctx.cwd, worktreePath)
+				: worktreePath;
 		}
 	});
 
