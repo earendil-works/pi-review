@@ -21,14 +21,14 @@
  * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
  *
  * Project-specific review guidelines:
- * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
- *   its contents are appended to the review prompt.
+ * - If a REVIEW_GUIDELINES.md file exists next to the project's config
+ *   directory (.pi by default), its contents are appended to the review prompt.
  *
  * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
@@ -275,15 +275,32 @@ Provide your findings in a clear, structured format:
 
 Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
 
+/**
+ * Candidate config dir names for the project-root marker. The default is
+ * ".pi". PI_CODING_AGENT_DIR can point the runtime at an agent dir under a
+ * differently named config dir, so also honor the name implied by that
+ * setting instead of hardcoding ".pi".
+ */
+function getConfigDirNames(): string[] {
+	const derived = path.basename(path.dirname(getAgentDir()));
+	return derived.startsWith(".") && derived !== ".pi" ? [derived, ".pi"] : [".pi"];
+}
+
 async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> {
 	let currentDir = path.resolve(cwd);
 
 	while (true) {
-		const piDir = path.join(currentDir, ".pi");
 		const guidelinesPath = path.join(currentDir, "REVIEW_GUIDELINES.md");
 
-		const piStats = await fs.stat(piDir).catch(() => null);
-		if (piStats?.isDirectory()) {
+		let hasConfigDir = false;
+		for (const name of getConfigDirNames()) {
+			const stats = await fs.stat(path.join(currentDir, name)).catch(() => null);
+			if (stats?.isDirectory()) {
+				hasConfigDir = true;
+				break;
+			}
+		}
+		if (hasConfigDir) {
 			const guidelineStats = await fs.stat(guidelinesPath).catch(() => null);
 			if (guidelineStats?.isFile()) {
 				try {
