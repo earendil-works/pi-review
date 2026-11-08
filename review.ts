@@ -19,6 +19,9 @@
  * - `/review folder src docs` - review specific folders/files (snapshot, not diff)
  * - `/review` selector includes Add/Remove custom review instructions (applies to all modes)
  * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
+ * - `/review uncommitted --auto` - review, fix findings, and re-review until clean
+ * - `/review branch main --auto --review-model anthropic/claude-opus-4 --max-rounds 4`
+ * - `/review-auto-stop` - stop the running auto review loop
  *
  * Project-specific review guidelines:
  * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
@@ -39,6 +42,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 
 // State to track fresh session review (where we branched from).
@@ -51,6 +55,8 @@ let reviewCustomInstructions: string | undefined = undefined;
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
 const REVIEW_SETTINGS_TYPE = "review-settings";
+const AUTO_STATE_TYPE = "review-auto";
+const AUTO_RESULT_PATTERN = /<!--\s*REVIEW_RESULT:\s*([\s\S]*?)\s*-->/g;
 const GH_SETUP_INSTRUCTIONS =
 	"Install GitHub CLI (`gh`) from https://cli.github.com/ (macOS: `brew install gh`), then sign in with `gh auth login` and verify with `gh auth status`.";
 const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
@@ -64,6 +70,290 @@ type ReviewSessionState = {
 type ReviewSettingsState = {
 	customInstructions?: string;
 };
+
+type ReviewModel = NonNullable<ExtensionContext["model"]>;
+type ReviewThinkingLevel = ReturnType<ExtensionAPI["getThinkingLevel"]>;
+
+type ModelRef = {
+	provider: string;
+	id: string;
+};
+
+// Auto review loop state. One snapshot is appended per transition, on the branch
+// where the transition happens, so branch-local reads stay meaningful.
+type AutoPhase = "review" | "fix" | "done" | "stopped" | "error";
+
+type AutoFinding = {
+	id: string;
+	priority: string;
+	location: string;
+	title: string;
+	detail?: string;
+};
+
+type AutoReviewResult = {
+	verdict: "pass" | "needs-attention";
+	findings: AutoFinding[];
+};
+
+type AutoSnapshot = {
+	v: 1;
+	runId: string;
+	branch: "main" | "review";
+	phase: AutoPhase;
+	round: number;
+	maxRounds: number;
+	target: ReviewTarget;
+	originId: string;
+	mainLeafId: string;
+	reviewLeafId?: string;
+	mainModel?: ModelRef;
+	mainThinkingLevel?: ReviewThinkingLevel;
+	reviewModel?: ModelRef;
+	lastVerdict?: AutoReviewResult["verdict"];
+	findingKeys?: string[];
+	findingCount?: number;
+	lastFixChangedTree?: boolean;
+	reason?: string;
+	startedAt: string;
+	updatedAt: string;
+};
+
+type AutoReviewOptions = {
+	reviewModel?: ReviewModel;
+	maxRounds: number;
+	summary?: boolean;
+	extraInstruction?: string;
+};
+
+// Runtime flags. The persisted snapshot is the recovery record; these flags drive
+// the in-process loop and are intentionally not restored automatically.
+let autoLoopRunning = false;
+let autoStopRequested = false;
+let autoRunStarted = false;
+let autoRunSettled = false;
+let autoRunAborted = false;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractAssistantText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) => {
+			if (!block || typeof block !== "object") return "";
+			const candidate = block as { type?: unknown; text?: unknown };
+			return candidate.type === "text" && typeof candidate.text === "string" ? candidate.text : "";
+		})
+		.filter((text) => text.length > 0)
+		.join("\n");
+}
+
+function getLastAssistantEntry(
+	ctx: ExtensionContext,
+): { id: string; text: string; stopReason?: string } | undefined {
+	const entries = ctx.sessionManager.getBranch();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		return {
+			id: entry.id,
+			text: extractAssistantText(entry.message.content),
+			stopReason: entry.message.stopReason,
+		};
+	}
+	return undefined;
+}
+
+function findingKey(finding: AutoFinding): string {
+	return `${finding.location}::${finding.title}`;
+}
+
+// Each failure mode is reported separately: unattended runs need to tell a
+// missing block apart from malformed JSON and from an unusable findings list.
+type AutoReviewParseFailure =
+	| "missing-result-block"
+	| "invalid-json"
+	| "invalid-verdict"
+	| "invalid-findings"
+	| "needs-attention-without-findings";
+
+type AutoReviewParse =
+	| { ok: true; result: AutoReviewResult }
+	| { ok: false; reason: AutoReviewParseFailure; detail?: string };
+
+function describeAutoReviewParseFailure(reason: AutoReviewParseFailure): string {
+	switch (reason) {
+		case "missing-result-block":
+			return "no REVIEW_RESULT block was found in the review output";
+		case "invalid-json":
+			return "the REVIEW_RESULT block is not valid JSON";
+		case "invalid-verdict":
+			return 'the REVIEW_RESULT "verdict" must be "pass" or "needs-attention"';
+		case "invalid-findings":
+			return "the REVIEW_RESULT findings are malformed (each needs a location and a title)";
+		case "needs-attention-without-findings":
+			return 'the REVIEW_RESULT verdict is "needs-attention" but no findings were reported';
+	}
+}
+
+function parseAutoReviewResult(text: string): AutoReviewParse {
+	let lastMatch: string | undefined;
+	AUTO_RESULT_PATTERN.lastIndex = 0;
+	for (let match = AUTO_RESULT_PATTERN.exec(text); match; match = AUTO_RESULT_PATTERN.exec(text)) {
+		lastMatch = match[1];
+	}
+	if (!lastMatch) return { ok: false, reason: "missing-result-block" };
+
+	let raw: unknown;
+	try {
+		raw = JSON.parse(lastMatch);
+	} catch (error) {
+		return {
+			reason: "invalid-json",
+			detail: error instanceof Error ? error.message : String(error),
+			ok: false,
+		};
+	}
+	if (!raw || typeof raw !== "object") {
+		return { ok: false, reason: "invalid-json", detail: "the REVIEW_RESULT payload is not a JSON object" };
+	}
+
+	const record = raw as { verdict?: unknown; findings?: unknown };
+	const verdict = record.verdict === "pass" || record.verdict === "needs-attention" ? record.verdict : undefined;
+	if (!verdict) {
+		return {
+			ok: false,
+			reason: "invalid-verdict",
+			detail: `got ${JSON.stringify(record.verdict)}`,
+		};
+	}
+
+	if (record.findings !== undefined && !Array.isArray(record.findings)) {
+		return { ok: false, reason: "invalid-findings", detail: '"findings" must be an array' };
+	}
+
+	const findings: AutoFinding[] = [];
+	for (const [index, item] of (record.findings ?? []).entries()) {
+		if (!item || typeof item !== "object") {
+			return { ok: false, reason: "invalid-findings", detail: `finding ${index + 1} is not an object` };
+		}
+		const finding = item as Record<string, unknown>;
+		const location =
+			typeof finding.location === "string"
+				? finding.location.trim()
+				: typeof finding.file === "string"
+					? finding.file.trim()
+					: "";
+		const title =
+			typeof finding.title === "string"
+				? finding.title.trim()
+				: typeof finding.summary === "string"
+					? finding.summary.trim()
+					: "";
+		// A finding without a location or title cannot be acted on and would
+		// collapse into the same key as every other malformed finding.
+		if (!location || !title) {
+			return {
+				ok: false,
+				reason: "invalid-findings",
+				detail: `finding ${index + 1} is missing a location or a title`,
+			};
+		}
+		const detail =
+			typeof finding.detail === "string"
+				? finding.detail.trim()
+				: typeof finding.why === "string"
+					? finding.why.trim()
+					: "";
+		findings.push({
+			id: String(finding.id ?? `F${index + 1}`),
+			priority: String(finding.priority ?? "P2"),
+			location,
+			title,
+			detail: detail ? detail.slice(0, 800) : undefined,
+		});
+	}
+
+	// needs-attention without a usable findings array is a malformed review, not
+	// a pass. Reporting it as a parse failure makes the loop stop.
+	if (verdict === "needs-attention" && findings.length === 0) {
+		return { ok: false, reason: "needs-attention-without-findings" };
+	}
+
+	// A "pass" with findings is contradictory; treat it as needs-attention so we
+	// do not silently discard actionable issues.
+	return {
+		ok: true,
+		result: {
+			verdict: findings.length === 0 ? "pass" : verdict === "pass" ? "needs-attention" : verdict,
+			findings,
+		},
+	};
+}
+
+function formatFindings(findings: AutoFinding[]): string {
+	if (findings.length === 0) return "(none)";
+	return findings
+		.map((finding, index) => {
+			const head = `${index + 1}. [${finding.priority}] ${finding.id} — ${finding.location} — ${finding.title}`;
+			if (!finding.detail) return head;
+			const detail = finding.detail.replace(/\s*\n\s*/g, " ").trim();
+			return `${head}\n   ${detail}`;
+		})
+		.join("\n");
+}
+
+function buildAutoProtocol(round: number, mode: "review" | "verify", previousFindings: AutoFinding[]): string {
+	const verifyContext =
+		mode === "verify"
+			? `\nThis is automated verification round ${round}. Fixes were applied to the same working tree.\nRead the current files from disk; do not trust diffs or code snippets from earlier in this conversation.\n\nPrevious findings:\n${formatFindings(previousFindings)}\n\nRe-check every previous finding. Only report findings that are still present. Keep the same ids when possible. Omit fixed findings. If everything is fixed, return \"verdict\":\"pass\" with an empty findings array.\n`
+			: "";
+
+	return `## Automated review protocol (required)
+
+This review runs inside an automated fix/verify loop. Do not edit files during a review round.${verifyContext}
+End your final message with exactly one machine-readable HTML comment (no code fence, no trailing text after it):
+
+<!--REVIEW_RESULT:{"verdict":"needs-attention","findings":[{"id":"F1","priority":"P1","location":"path/to/file.ext:line","title":"short actionable issue","detail":"1-3 sentences: why it matters and what should change"}]}-->
+
+Rules:
+- Use "verdict":"pass" only when there are no actionable findings; findings must then be empty.
+- Otherwise use "verdict":"needs-attention" and list every actionable finding.
+- priority must be one of P0, P1, P2, P3.
+- location must be a concrete path with a line number where possible.
+- detail should be short (1-3 sentences); it is what the fix agent receives instead of the full review prose.
+- Keep finding ids stable across rounds when reporting the same issue.
+- Emit the comment exactly once, at the very end.`;
+}
+
+function buildAutoFixPrompt(findings: AutoFinding[]): string {
+	return `The automated code review found the following actionable issues. Fix them now in the current working tree.
+
+Hard constraints:
+- Do NOT commit, switch git branches, stash, reset, or checkout. Leave changes uncommitted in the shared working tree.
+- Keep the scope to these findings.
+- Treat "Human Reviewer Callouts (Non-Blocking)" as informational only.
+
+Process:
+- Fix in priority order: P0, P1, then P2 (include P3 only if quick and safe).
+- If a finding is invalid, already fixed, or not possible right now, briefly explain why and continue.
+- Follow fail-fast error handling: do not add local catch/fallback recovery unless this scope is an explicit boundary that can safely translate the failure.
+- If you add or keep a try/catch, explain the expected failure mode and either rethrow with context or return a boundary-safe error response.
+- Run relevant tests/checks for touched code where practical.
+- End with: fixed items, deferred/skipped items (with reasons), and verification results.
+
+Findings:
+${formatFindings(findings)}`;
+}
+
+function requestAutoStop(ctx: ExtensionContext): void {
+	autoStopRequested = true;
+	ctx.abort();
+	ctx.ui.notify("Stopping the auto review loop...", "info");
+}
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
 	if (!ctx.hasUI) return;
@@ -661,6 +951,34 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		applyAllReviewState(ctx);
+		const latest = readLatestAutoState(ctx);
+		if (latest && latest.phase !== "done" && latest.phase !== "stopped" && latest.phase !== "error") {
+			ctx.ui.notify(
+				`Auto review was interrupted during ${latest.phase} (round ${latest.round}/${latest.maxRounds}). Inspect the tree and continue manually, or start a new review.`,
+				"warning",
+			);
+		}
+		setAutoWidget(ctx, undefined);
+	});
+
+	pi.on("agent_start", () => {
+		autoRunStarted = true;
+	});
+
+	pi.on("agent_end", (event) => {
+		autoRunSettled = true;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const message = event.messages[i];
+			if (message.role !== "assistant") continue;
+			if (message.stopReason === "aborted") autoRunAborted = true;
+			break;
+		}
+	});
+
+	pi.on("input", (event, ctx) => {
+		if (!autoLoopRunning || event.source !== "interactive") return;
+		ctx.ui.notify("Auto review is running. Use /review-auto-stop or Esc to stop it.", "info");
+		return { action: "handled" };
 	});
 
 
@@ -1083,6 +1401,95 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	/**
 	 * Execute the review
 	 */
+	async function enterFreshReviewBranch(ctx: ExtensionCommandContext): Promise<string | null> {
+		// Store current position (where we'll return to).
+		// In an empty session there is no leaf yet, so create a lightweight anchor first.
+		let originId = ctx.sessionManager.getLeafId() ?? undefined;
+		if (!originId) {
+			pi.appendEntry(REVIEW_ANCHOR_TYPE, { createdAt: new Date().toISOString() });
+			originId = ctx.sessionManager.getLeafId() ?? undefined;
+		}
+		if (!originId) {
+			ctx.ui.notify("Failed to determine review origin.", "error");
+			return null;
+		}
+		reviewOriginId = originId;
+
+		// Keep a local copy so session_tree events during navigation don't wipe it
+		const lockedOriginId = originId;
+
+		// Find the first user message in the session.
+		// If none exists (e.g. brand-new session), we'll stay on the current leaf.
+		const entries = ctx.sessionManager.getEntries();
+		const firstUserMessage = entries.find(
+			(e) => e.type === "message" && e.message.role === "user",
+		);
+
+		if (firstUserMessage) {
+			// Navigate to first user message to create a new branch from that point
+			// Label it as "code-review" so it's visible in the tree
+			try {
+				const result = await ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" });
+				if (result.cancelled) {
+					reviewOriginId = undefined;
+					return null;
+				}
+			} catch (error) {
+				// Clean up state if navigation fails
+				reviewOriginId = undefined;
+				ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return null;
+			}
+
+			// Clear the editor (navigating to user message fills it with the message text)
+			ctx.ui.setEditorText("");
+		}
+
+		// Restore origin after navigation events (session_tree can reset it)
+		reviewOriginId = lockedOriginId;
+
+		// Show widget indicating review is active
+		setReviewWidget(ctx, true);
+
+		// Persist review state so tree navigation can restore/reset it
+		pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
+		return lockedOriginId;
+	}
+
+	async function buildFullReviewPrompt(
+		ctx: ExtensionCommandContext,
+		target: ReviewTarget,
+		extraInstruction?: string,
+		auto?: { round: number },
+	): Promise<string> {
+		const prompt = await buildReviewPrompt(pi, target);
+		const projectGuidelines = await loadProjectReviewGuidelines(ctx.cwd);
+
+		// Combine the review rubric with the specific prompt
+		let fullPrompt = `${REVIEW_RUBRIC}\n\n---\n\nPlease perform a code review with the following focus:\n\n${prompt}`;
+
+		if (reviewCustomInstructions) {
+			fullPrompt += `\n\nShared custom review instructions (applies to all reviews):\n\n${reviewCustomInstructions}`;
+		}
+
+		if (extraInstruction?.trim()) {
+			fullPrompt += `\n\nAdditional user-provided review instruction:\n\n${extraInstruction.trim()}`;
+		}
+
+		if (projectGuidelines) {
+			fullPrompt += `\n\nThis project has additional instructions for code reviews:\n\n${projectGuidelines}`;
+		}
+
+		// Keep last so it overrides any other language guidance
+		fullPrompt += `\n\n${REVIEW_OUTPUT_LANGUAGE}`;
+
+		if (auto) {
+			fullPrompt += `\n\n${buildAutoProtocol(auto.round, "review", [])}`;
+		}
+
+		return fullPrompt;
+	}
+
 	async function executeReview(
 		ctx: ExtensionCommandContext,
 		target: ReviewTarget,
@@ -1095,82 +1502,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
-		// Handle fresh session mode
 		if (useFreshSession) {
-			// Store current position (where we'll return to).
-			// In an empty session there is no leaf yet, so create a lightweight anchor first.
-			let originId = ctx.sessionManager.getLeafId() ?? undefined;
-			if (!originId) {
-				pi.appendEntry(REVIEW_ANCHOR_TYPE, { createdAt: new Date().toISOString() });
-				originId = ctx.sessionManager.getLeafId() ?? undefined;
-			}
-			if (!originId) {
-				ctx.ui.notify("Failed to determine review origin.", "error");
-				return false;
-			}
-			reviewOriginId = originId;
-
-			// Keep a local copy so session_tree events during navigation don't wipe it
-			const lockedOriginId = originId;
-
-			// Find the first user message in the session.
-			// If none exists (e.g. brand-new session), we'll stay on the current leaf.
-			const entries = ctx.sessionManager.getEntries();
-			const firstUserMessage = entries.find(
-				(e) => e.type === "message" && e.message.role === "user",
-			);
-
-			if (firstUserMessage) {
-				// Navigate to first user message to create a new branch from that point
-				// Label it as "code-review" so it's visible in the tree
-				try {
-					const result = await ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" });
-					if (result.cancelled) {
-						reviewOriginId = undefined;
-						return false;
-					}
-				} catch (error) {
-					// Clean up state if navigation fails
-					reviewOriginId = undefined;
-					ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return false;
-				}
-
-				// Clear the editor (navigating to user message fills it with the message text)
-				ctx.ui.setEditorText("");
-			}
-
-			// Restore origin after navigation events (session_tree can reset it)
-			reviewOriginId = lockedOriginId;
-
-			// Show widget indicating review is active
-			setReviewWidget(ctx, true);
-
-			// Persist review state so tree navigation can restore/reset it
-			pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
+			const originId = await enterFreshReviewBranch(ctx);
+			if (!originId) return false;
 		}
 
-		const prompt = await buildReviewPrompt(pi, target);
+		const fullPrompt = await buildFullReviewPrompt(ctx, target, options?.extraInstruction);
 		const hint = getUserFacingHint(target);
-		const projectGuidelines = await loadProjectReviewGuidelines(ctx.cwd);
-
-		// Combine the review rubric with the specific prompt
-		let fullPrompt = `${REVIEW_RUBRIC}\n\n---\n\nPlease perform a code review with the following focus:\n\n${prompt}`;
-
-		if (reviewCustomInstructions) {
-			fullPrompt += `\n\nShared custom review instructions (applies to all reviews):\n\n${reviewCustomInstructions}`;
-		}
-
-		if (options?.extraInstruction?.trim()) {
-			fullPrompt += `\n\nAdditional user-provided review instruction:\n\n${options.extraInstruction.trim()}`;
-		}
-
-		if (projectGuidelines) {
-			fullPrompt += `\n\nThis project has additional instructions for code reviews:\n\n${projectGuidelines}`;
-		}
-
-		// Keep last so it overrides any other language guidance
-		fullPrompt += `\n\n${REVIEW_OUTPUT_LANGUAGE}`;
 
 		const modeHint = useFreshSession ? " (fresh session)" : "";
 		ctx.ui.notify(`Starting review: ${hint}${modeHint}`, "info");
@@ -1180,13 +1518,631 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
+	// ---------------------------------------------------------------------
+	// Auto review loop (review -> fix -> re-review until clean)
+	// ---------------------------------------------------------------------
+
+	const AUTO_FIX_SUMMARY_PROMPT = `We are leaving the main coding branch and returning to the code-review branch for verification.
+Summarize what was changed to address the review findings. Include:
+- Which findings were addressed and how
+- Which findings were skipped/deferred and why
+- Tests/checks that were run and their results
+- Any new risks or behavior changes introduced by the fixes
+Keep it concise and factual; the reviewer will verify against the actual files.`;
+
+	function persistAutoState(snapshot: AutoSnapshot): void {
+		pi.appendEntry(AUTO_STATE_TYPE, { ...snapshot, updatedAt: new Date().toISOString() });
+	}
+
+	function readLatestAutoState(ctx: ExtensionContext): AutoSnapshot | undefined {
+		let latest: AutoSnapshot | undefined;
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== AUTO_STATE_TYPE) continue;
+			const data = entry.data as AutoSnapshot | undefined;
+			if (data && data.v === 1) latest = data;
+		}
+		return latest;
+	}
+
+	function setAutoWidget(ctx: ExtensionContext, snapshot: AutoSnapshot | undefined): void {
+		if (!ctx.hasUI) return;
+		if (!snapshot) {
+			ctx.ui.setWidget("review-auto", undefined);
+			return;
+		}
+
+		const phaseLabel =
+			snapshot.phase === "review"
+				? "reviewing"
+				: snapshot.phase === "fix"
+					? "fixing findings"
+					: snapshot.phase;
+
+		ctx.ui.setWidget("review-auto", (_tui, theme) => {
+			const text = new Text(
+				theme.fg(
+					"accent",
+					`Auto review · round ${snapshot.round}/${snapshot.maxRounds} · ${phaseLabel} · /review-auto-stop to stop`,
+				),
+				0,
+				0,
+			);
+			return {
+				render(width: number) {
+					return text.render(width);
+				},
+				invalidate() {
+					text.invalidate();
+				},
+			};
+		});
+	}
+
+	function resolveStoredModel(ctx: ExtensionContext, ref: ModelRef | undefined): ReviewModel | undefined {
+		if (!ref) return undefined;
+		return ctx.modelRegistry.find(ref.provider, ref.id);
+	}
+
+	function findModelByRef(ctx: ExtensionContext, ref: string): ReviewModel | undefined {
+		const slash = ref.indexOf("/");
+		if (slash > 0) {
+			const found = ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
+			if (found) return found;
+		}
+		return ctx.modelRegistry.getAvailable().find((model) => model.id === ref || `${model.provider}/${model.id}` === ref);
+	}
+
+	function modelRef(model: ReviewModel | undefined): ModelRef | undefined {
+		return model ? { provider: model.provider, id: model.id } : undefined;
+	}
+
+	// Distinguishes "nothing was saved" from "saved model can no longer be
+	// resolved": the latter is a real failure and must not be reported as a
+	// successful restore while the review model stays active.
+	type StoredModelApply = "none" | "ok" | "missing" | "failed";
+
+	async function applyStoredModel(
+		ctx: ExtensionContext,
+		ref: ModelRef | undefined,
+	): Promise<StoredModelApply> {
+		if (!ref) return "none";
+		const model = resolveStoredModel(ctx, ref);
+		if (!model) return "missing";
+		return (await applyModel(model)) ? "ok" : "failed";
+	}
+
+	async function applyModel(model: ReviewModel | undefined): Promise<boolean> {
+		if (!model) return true;
+		try {
+			return await pi.setModel(model);
+		} catch {
+			return false;
+		}
+	}
+
+	function applyThinking(level: ReviewThinkingLevel | undefined): void {
+		if (!level) return;
+		// `pi.setThinkingLevel` clamps to what the current model supports and does
+		// not throw. Swallowing errors here would hide real failures and silently
+		// keep the wrong thinking level for the remaining rounds.
+		pi.setThinkingLevel(level);
+	}
+
+	async function gitOutput(args: string[]): Promise<string> {
+		const result = await pi.exec("git", args);
+		if (result.code !== 0) {
+			throw new Error(
+				`git ${args.join(" ")} failed (exit code ${result.code}): ${result.stderr.trim()}`,
+			);
+		}
+		return result.stdout;
+	}
+
+	async function getWorkingTreeHash(): Promise<string> {
+		const hash = createHash("sha1");
+		// Include HEAD so a fix agent that commits despite the instructions is still
+		// visible as progress. `--verify` fails on an unborn HEAD (repository with
+		// no commits yet), which is an expected state, not an error.
+		const head = await pi.exec("git", ["rev-parse", "--verify", "HEAD"]);
+		hash.update(head.code === 0 ? head.stdout.trim() : "unborn");
+		hash.update("\u0000");
+		// `git diff` covers unstaged changes and `git diff --cached` covers staged
+		// changes. Together they match `git diff HEAD` but also work in a repository
+		// with no commits yet (unborn HEAD).
+		hash.update(await gitOutput(["diff"]));
+		hash.update("\u0000");
+		hash.update(await gitOutput(["diff", "--cached"]));
+		hash.update("\u0000");
+
+		const untracked = (await gitOutput(["ls-files", "--others", "--exclude-standard", "-z"]))
+			.split("\u0000")
+			.filter((file) => file.length > 0)
+			.sort();
+		if (untracked.length > 0) {
+			hash.update(untracked.join("\u0000"));
+			hash.update("\u0000");
+			hash.update(await gitOutput(["hash-object", "--no-filters", "--", ...untracked]));
+		}
+
+		// Ignored paths are deliberately excluded from progress detection: test and
+		// build runs create/delete them without the fix agent changing anything, so
+		// including them would defeat the no-progress stop condition.
+		return hash.digest("hex");
+	}
+
+	async function navigateIdleTo(
+		ctx: ExtensionCommandContext,
+		targetId: string,
+		summaryPrompt?: string,
+	): Promise<boolean> {
+		await ctx.waitForIdle();
+		if (summaryPrompt) {
+			// --summary is an explicit request, so a failed or impossible summary is
+			// surfaced instead of silently degrading to an unsummarized navigation.
+			// Expected failure modes: no model selected, or the summarization call
+			// itself failing (e.g. auth/provider error). Both propagate to the caller.
+			if (!ctx.model) {
+				throw new Error("cannot summarize the review branch: no model is available for the summary");
+			}
+			const result = await ctx.navigateTree(targetId, {
+				summarize: true,
+				customInstructions: summaryPrompt,
+				replaceInstructions: true,
+			});
+			return !result.cancelled;
+		}
+		const result = await ctx.navigateTree(targetId, { summarize: false });
+		return !result.cancelled;
+	}
+
+	async function sendAndWait(
+		ctx: ExtensionCommandContext,
+		prompt: string,
+	): Promise<{ aborted: boolean; producedAssistant: boolean }> {
+		autoRunStarted = false;
+		autoRunSettled = false;
+		autoRunAborted = false;
+		const leafBefore = ctx.sessionManager.getLeafId();
+		const assistantBefore = getLastAssistantEntry(ctx)?.id;
+		pi.sendUserMessage(prompt);
+
+		// `pi.sendUserMessage` is fire-and-forget, so wait until the run is
+		// observable before waiting for it to settle.
+		const deadline = Date.now() + 20_000;
+		while (!autoRunStarted && !autoRunSettled && ctx.isIdle() && Date.now() < deadline) {
+			await sleep(25);
+		}
+
+		const leafAfter = ctx.sessionManager.getLeafId();
+		const runObserved =
+			autoRunStarted || autoRunSettled || !ctx.isIdle() || leafAfter !== leafBefore;
+		if (!runObserved) {
+			throw new Error("The agent run did not start (the message may have been intercepted).");
+		}
+		if (!ctx.isIdle()) {
+			await ctx.waitForIdle();
+		}
+
+		const assistantAfter = getLastAssistantEntry(ctx);
+		return {
+			aborted: autoRunAborted || autoStopRequested,
+			producedAssistant: assistantAfter !== undefined && assistantAfter.id !== assistantBefore,
+		};
+	}
+
+	async function showAutoReviewModelSelector(
+		ctx: ExtensionCommandContext,
+	): Promise<{ model?: ReviewModel } | null> {
+		const current = ctx.model;
+		const currentLabel = current ? `${current.provider}/${current.id}` : "current model";
+		// `scopedModels` exists on newer Pi versions; fall back to the full catalogue.
+		const maybeScoped = (ctx as unknown as { scopedModels?: Array<{ model: ReviewModel }> }).scopedModels;
+		const candidates = (maybeScoped && maybeScoped.length > 0 ? maybeScoped.map((entry) => entry.model) : ctx.modelRegistry.getAvailable())
+			.slice()
+			.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+
+		const items = [`Use current model (${currentLabel})`];
+		const seen = new Set<string>([currentLabel]);
+		for (const model of candidates) {
+			const key = `${model.provider}/${model.id}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			items.push(key);
+		}
+
+		const choice = await ctx.ui.select("Model for the review branch:", items);
+		if (choice === undefined) return null;
+		if (choice === items[0]) return {};
+
+		const model = findModelByRef(ctx, choice);
+		if (!model) {
+			ctx.ui.notify(`Model not found: ${choice}`, "error");
+			return null;
+		}
+		return { model };
+	}
+
+	async function showAutoMaxRoundsSelector(ctx: ExtensionCommandContext): Promise<number | null> {
+		const choice = await ctx.ui.select("Max auto-review rounds:", ["3", "5", "10"]);
+		if (choice === undefined) return null;
+		return Number.parseInt(choice, 10);
+	}
+
+	/** Whether the current leaf still lives on the review branch. */
+	function isOnReviewBranch(ctx: ExtensionContext, snapshot: AutoSnapshot): boolean {
+		const reviewLeafId = snapshot.reviewLeafId;
+		if (!reviewLeafId) return snapshot.branch === "review";
+		return ctx.sessionManager.getBranch().some((entry) => entry.id === reviewLeafId);
+	}
+
+	async function finishAutoReview(
+		ctx: ExtensionCommandContext,
+		snapshot: AutoSnapshot,
+		phase: AutoPhase,
+		reason: string,
+	): Promise<void> {
+		try {
+			// Trust the tree, not the snapshot: the caller may have navigated just
+			// before an error, leaving snapshot.branch stale.
+			if (isOnReviewBranch(ctx, snapshot)) {
+				const reviewLeafId = ctx.sessionManager.getLeafId() ?? snapshot.reviewLeafId;
+				persistAutoState({ ...snapshot, phase, reason, reviewLeafId });
+				pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
+				if (!(await navigateIdleTo(ctx, snapshot.mainLeafId))) {
+					ctx.ui.notify(
+						"Auto review could not return to the main branch: navigation was cancelled. You are still on the review branch.",
+						"warning",
+					);
+					persistAutoState({ ...snapshot, phase: "error", reason: `${reason} (navigation cancelled)` });
+					return;
+				}
+			}
+
+			const modelResult = await applyStoredModel(ctx, snapshot.mainModel);
+			if (modelResult === "missing" || modelResult === "failed") {
+				const label = snapshot.mainModel
+					? `${snapshot.mainModel.provider}/${snapshot.mainModel.id}`
+					: "the main branch model";
+				ctx.ui.notify(
+					modelResult === "missing"
+						? `Auto review could not restore ${label}: the model is no longer available. The current model is still in use.`
+						: `Auto review could not restore ${label}; the current model is still in use.`,
+					"error",
+				);
+				// We are back on the main branch, so leaving the review state behind
+				// would make the next /review report "Already in a review".
+				persistAutoState({
+					...snapshot,
+					branch: "main",
+					phase: "error",
+					reason: `failed to restore main branch model (${reason})`,
+				});
+				clearReviewState(ctx);
+				return;
+			}
+			applyThinking(snapshot.mainThinkingLevel);
+
+			const mainLeafId = ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId;
+			persistAutoState({ ...snapshot, branch: "main", phase, reason, mainLeafId });
+			clearReviewState(ctx);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Failed to finish auto review cleanly: ${message}`, "warning");
+
+			// Navigation may already have succeeded before this failure. Read the
+			// actual position from the session tree instead of trusting the stale
+			// snapshot, so an error on the main branch does not leave the session
+			// marked "in review" (which would block the next /review).
+			const onReviewBranch = isOnReviewBranch(ctx, snapshot);
+			try {
+				persistAutoState({
+					...snapshot,
+					branch: onReviewBranch ? "review" : "main",
+					phase: "error",
+					reason: `${reason}: ${message}`,
+					mainLeafId: onReviewBranch
+						? snapshot.mainLeafId
+						: (ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId),
+				});
+			} catch (persistError) {
+				ctx.ui.notify(
+					`Failed to record the auto review error state: ${persistError instanceof Error ? persistError.message : String(persistError)}`,
+					"warning",
+				);
+			}
+
+			if (!onReviewBranch) {
+				try {
+					clearReviewState(ctx);
+				} catch (cleanupError) {
+					ctx.ui.notify(
+						`Failed to clear the review state: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+						"warning",
+					);
+				}
+			}
+		} finally {
+			setAutoWidget(ctx, undefined);
+			setReviewWidget(ctx, false);
+		}
+	}
+
+	async function runAutoReviewLoop(
+		ctx: ExtensionCommandContext,
+		target: ReviewTarget,
+		options: AutoReviewOptions,
+	): Promise<void> {
+		if (autoLoopRunning) {
+			ctx.ui.notify("Auto review is already running. Use /review-auto-stop to stop it.", "warning");
+			return;
+		}
+
+		autoLoopRunning = true;
+		autoStopRequested = false;
+
+		const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const startedAt = new Date().toISOString();
+		const mainModel = ctx.model;
+		const mainThinkingLevel = pi.getThinkingLevel();
+		let reviewModel = options.reviewModel;
+		const hint = getUserFacingHint(target);
+		let reviewModelWarned = false;
+		let snapshot: AutoSnapshot | undefined;
+
+		try {
+			const originId = await enterFreshReviewBranch(ctx);
+			if (!originId) return;
+
+			if (reviewModel && !(await applyModel(reviewModel)) && !reviewModelWarned) {
+				reviewModelWarned = true;
+				ctx.ui.notify(
+					`No authentication for ${reviewModel.provider}/${reviewModel.id}; using the current model for the review branch.`,
+					"warning",
+				);
+				reviewModel = undefined;
+			}
+
+			snapshot = {
+				v: 1,
+				runId,
+				branch: "review",
+				phase: "review",
+				round: 1,
+				maxRounds: options.maxRounds,
+				target,
+				originId,
+				mainLeafId: originId,
+				reviewLeafId: ctx.sessionManager.getLeafId() ?? originId,
+				mainModel: modelRef(mainModel),
+				mainThinkingLevel,
+				reviewModel: modelRef(reviewModel),
+				startedAt,
+				updatedAt: startedAt,
+			};
+			persistAutoState(snapshot);
+			snapshot.reviewLeafId = ctx.sessionManager.getLeafId() ?? snapshot.reviewLeafId;
+			setAutoWidget(ctx, snapshot);
+			ctx.ui.notify(`Auto review started: ${hint} (max ${options.maxRounds} rounds)`, "info");
+
+			let round = 1;
+			let previousKeys = "";
+			let lastFixChangedTree = false;
+
+			let run = await sendAndWait(
+				ctx,
+				await buildFullReviewPrompt(ctx, target, options.extraInstruction, { round: 1 }),
+			);
+			if (autoStopRequested || run.aborted) {
+				await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+				return;
+			}
+			if (!run.producedAssistant) {
+				ctx.ui.notify("Auto review stopped: the review run produced no assistant response.", "error");
+				await finishAutoReview(ctx, snapshot, "error", "review produced no assistant response");
+				return;
+			}
+
+			while (true) {
+				if (autoStopRequested) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+
+				const assistant = getLastAssistantEntry(ctx);
+				if (!assistant || assistant.stopReason === "error") {
+					ctx.ui.notify("Auto review stopped: the review run failed. Inspect the transcript and continue manually.", "error");
+					await finishAutoReview(ctx, snapshot, "error", "review run failed");
+					return;
+				}
+
+				const parsed = parseAutoReviewResult(assistant.text);
+				if (!parsed.ok) {
+					const description = describeAutoReviewParseFailure(parsed.reason);
+					ctx.ui.notify(
+						`Auto review stopped: ${description}${parsed.detail ? ` (${parsed.detail})` : ""}. Continue manually with /end-review.`,
+						"warning",
+					);
+					await finishAutoReview(ctx, snapshot, "error", `invalid REVIEW_RESULT: ${parsed.reason}`);
+					return;
+				}
+				const review = parsed.result;
+
+				let reviewLeafId: string =
+					ctx.sessionManager.getLeafId() ?? snapshot.reviewLeafId ?? snapshot.originId;
+				snapshot = {
+					...snapshot,
+					branch: "review",
+					phase: "review",
+					round,
+					reviewLeafId,
+					lastVerdict: review.verdict,
+					findingCount: review.findings.length,
+					findingKeys: review.findings.map(findingKey),
+				};
+				persistAutoState(snapshot);
+				reviewLeafId = ctx.sessionManager.getLeafId() ?? reviewLeafId;
+				snapshot = { ...snapshot, reviewLeafId };
+				setAutoWidget(ctx, snapshot);
+
+				if (review.findings.length === 0) {
+					await finishAutoReview(ctx, snapshot, "done", "no findings");
+					ctx.ui.notify(`Auto review complete: no findings after ${round} round(s).`, "info");
+					return;
+				}
+
+				const keys = review.findings.map(findingKey).sort().join("|");
+				if (round > 1 && keys === previousKeys && !lastFixChangedTree) {
+					ctx.ui.notify(
+						`Auto review stopped: findings did not change and the fix round made no file changes (round ${round}).`,
+						"warning",
+					);
+					await finishAutoReview(ctx, snapshot, "stopped", "no progress");
+					return;
+				}
+				previousKeys = keys;
+
+				if (round >= options.maxRounds) {
+					ctx.ui.notify(
+						`Auto review stopped after ${round} round(s); ${review.findings.length} finding(s) remain.`,
+						"warning",
+					);
+					await finishAutoReview(ctx, snapshot, "stopped", `max rounds reached (${round})`);
+					return;
+				}
+
+				// Return to the main branch and fix.
+				if (autoStopRequested) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+				if (!(await navigateIdleTo(ctx, snapshot.mainLeafId, options.summary ? REVIEW_SUMMARY_PROMPT : undefined))) {
+					ctx.ui.notify("Auto review stopped: returning to the main branch was cancelled.", "warning");
+					await finishAutoReview(ctx, snapshot, "stopped", "navigation to main branch cancelled");
+					return;
+				}
+				const mainModelResult = await applyStoredModel(ctx, snapshot.mainModel);
+				if (mainModelResult === "missing" || mainModelResult === "failed") {
+					// finishAutoReview retries the restore and surfaces the failure to the user.
+					await finishAutoReview(ctx, { ...snapshot, branch: "main" }, "error", "failed to restore main branch model");
+					return;
+				}
+				applyThinking(snapshot.mainThinkingLevel);
+
+				let mainLeafId: string = ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId;
+				snapshot = { ...snapshot, branch: "main", phase: "fix", mainLeafId, reviewLeafId };
+				persistAutoState(snapshot);
+				mainLeafId = ctx.sessionManager.getLeafId() ?? mainLeafId;
+				snapshot = { ...snapshot, mainLeafId };
+				setAutoWidget(ctx, snapshot);
+
+				const hashBeforeFix = await getWorkingTreeHash();
+				run = await sendAndWait(ctx, buildAutoFixPrompt(review.findings));
+				if (autoStopRequested || run.aborted) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+				if (!run.producedAssistant) {
+					ctx.ui.notify("Auto review stopped: the fix run produced no assistant response.", "error");
+					await finishAutoReview(ctx, snapshot, "error", "fix produced no assistant response");
+					return;
+				}
+
+				const fixAssistant = getLastAssistantEntry(ctx);
+				if (!fixAssistant || fixAssistant.stopReason === "error") {
+					ctx.ui.notify("Auto review stopped: the fix run failed. Inspect the working tree and continue manually.", "error");
+					await finishAutoReview(ctx, snapshot, "error", "fix run failed");
+					return;
+				}
+
+				const hashAfterFix = await getWorkingTreeHash();
+				lastFixChangedTree = hashBeforeFix !== hashAfterFix;
+				snapshot = {
+					...snapshot,
+					phase: "review",
+					round: round + 1,
+					mainLeafId: ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId,
+					lastFixChangedTree,
+				};
+				persistAutoState(snapshot);
+				snapshot.mainLeafId = ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId;
+
+				// Return to the review branch and verify.
+				if (autoStopRequested) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+				if (!(await navigateIdleTo(ctx, reviewLeafId, options.summary ? AUTO_FIX_SUMMARY_PROMPT : undefined))) {
+					ctx.ui.notify("Auto review stopped: returning to the review branch was cancelled.", "warning");
+					await finishAutoReview(ctx, snapshot, "stopped", "navigation to review branch cancelled");
+					return;
+				}
+				if (reviewModel && !(await applyModel(reviewModel)) && !reviewModelWarned) {
+					reviewModelWarned = true;
+					ctx.ui.notify(
+						`No authentication for ${reviewModel.provider}/${reviewModel.id}; continuing verification with the current model.`,
+						"warning",
+					);
+					reviewModel = undefined;
+				}
+				if (!reviewModel) {
+					applyThinking(snapshot.mainThinkingLevel);
+				}
+
+				round += 1;
+				const nextReviewLeafId: string = ctx.sessionManager.getLeafId() ?? reviewLeafId;
+				snapshot = { ...snapshot, branch: "review", phase: "review", round, reviewLeafId: nextReviewLeafId };
+				persistAutoState(snapshot);
+				reviewLeafId = ctx.sessionManager.getLeafId() ?? nextReviewLeafId;
+				snapshot = { ...snapshot, reviewLeafId };
+				setAutoWidget(ctx, snapshot);
+
+				if (autoStopRequested) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+
+				run = await sendAndWait(
+					ctx,
+					`${buildAutoProtocol(round, "verify", review.findings)}${
+						fixAssistant.text.trim() ? `\n\nFix report from the implementing agent:\n${fixAssistant.text.trim().slice(0, 4000)}` : ""
+					}\n\n${REVIEW_OUTPUT_LANGUAGE}`,
+				);
+				if (autoStopRequested || run.aborted) {
+					await finishAutoReview(ctx, snapshot, "stopped", "stopped by user");
+					return;
+				}
+				if (!run.producedAssistant) {
+					ctx.ui.notify("Auto review stopped: the verification run produced no assistant response.", "error");
+					await finishAutoReview(ctx, snapshot, "error", "verification produced no assistant response");
+					return;
+				}
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Auto review failed: ${message}`, "error");
+			if (snapshot) {
+				await finishAutoReview(ctx, snapshot, "error", message);
+			}
+		} finally {
+			autoLoopRunning = false;
+			setAutoWidget(ctx, undefined);
+		}
+	}
+
 	/**
 	 * Parse command arguments for direct invocation
 	 * Returns the target or a special marker for PR that needs async handling
 	 */
+	type ParsedAutoFlags = {
+		reviewModel?: string;
+		maxRounds?: number;
+		summary: boolean;
+	};
+
 	type ParsedReviewArgs = {
 		target: ReviewTarget | { type: "pr"; ref: string } | null;
 		extraInstruction?: string;
+		auto?: ParsedAutoFlags;
 		error?: string;
 	};
 
@@ -1241,6 +2197,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		const rawParts = tokenizeArgs(args.trim());
 		const parts: string[] = [];
 		let extraInstruction: string | undefined;
+		let autoRequested = false;
+		let autoReviewModel: string | undefined;
+		let autoMaxRounds: number | undefined;
+		let autoSummary = false;
 
 		for (let i = 0; i < rawParts.length; i++) {
 			const part = rawParts[i];
@@ -1259,47 +2219,100 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (part === "--auto") {
+				autoRequested = true;
+				continue;
+			}
+
+			if (part === "--summary") {
+				autoSummary = true;
+				continue;
+			}
+
+			if (part === "--review-model") {
+				const next = rawParts[i + 1];
+				if (!next) return { target: null, error: "Missing value for --review-model" };
+				autoReviewModel = next;
+				i += 1;
+				continue;
+			}
+
+			if (part.startsWith("--review-model=")) {
+				autoReviewModel = part.slice("--review-model=".length);
+				continue;
+			}
+
+			if (part === "--max-rounds") {
+				const next = rawParts[i + 1];
+				if (!next) return { target: null, error: "Missing value for --max-rounds" };
+				autoMaxRounds = Number.parseInt(next, 10);
+				i += 1;
+				continue;
+			}
+
+			if (part.startsWith("--max-rounds=")) {
+				autoMaxRounds = Number.parseInt(part.slice("--max-rounds=".length), 10);
+				continue;
+			}
+
 			parts.push(part);
 		}
 
+		if (autoMaxRounds !== undefined && (!Number.isFinite(autoMaxRounds) || autoMaxRounds < 1 || autoMaxRounds > 20)) {
+			return { target: null, error: "--max-rounds must be between 1 and 20" };
+		}
+
+		if (!autoRequested && (autoReviewModel !== undefined || autoMaxRounds !== undefined || autoSummary)) {
+			return {
+				target: null,
+				error: "--summary, --review-model, and --max-rounds require --auto",
+			};
+		}
+
+		const auto: ParsedAutoFlags | undefined = autoRequested
+			? { reviewModel: autoReviewModel, maxRounds: autoMaxRounds, summary: autoSummary }
+			: undefined;
+
+		const parsed = (target: ParsedReviewArgs["target"]): ParsedReviewArgs =>
+			auto ? { target, extraInstruction, auto } : { target, extraInstruction };
+
 		if (parts.length === 0) {
-			return { target: null, extraInstruction };
+			return parsed(null);
 		}
 
 		const subcommand = parts[0]?.toLowerCase();
 
 		switch (subcommand) {
 			case "uncommitted":
-				return { target: { type: "uncommitted" }, extraInstruction };
+				return parsed({ type: "uncommitted" });
 
 			case "branch": {
 				const branch = parts[1];
-				if (!branch) return { target: null, extraInstruction };
-				return { target: { type: "baseBranch", branch }, extraInstruction };
+				if (!branch) return parsed(null);
+				return parsed({ type: "baseBranch", branch });
 			}
 
 			case "commit": {
 				const sha = parts[1];
-				if (!sha) return { target: null, extraInstruction };
+				if (!sha) return parsed(null);
 				const title = parts.slice(2).join(" ") || undefined;
-				return { target: { type: "commit", sha, title }, extraInstruction };
+				return parsed({ type: "commit", sha, title });
 			}
-
 
 			case "folder": {
 				const paths = parseReviewPaths(parts.slice(1).join(" "));
-				if (paths.length === 0) return { target: null, extraInstruction };
-				return { target: { type: "folder", paths }, extraInstruction };
+				if (paths.length === 0) return parsed(null);
+				return parsed({ type: "folder", paths });
 			}
 
 			case "pr": {
 				const ref = parts[1];
-				if (!ref) return { target: null, extraInstruction };
-				return { target: { type: "pr", ref }, extraInstruction };
+				if (!ref) return parsed(null);
+				return parsed({ type: "pr", ref });
 			}
 
 			default:
-				return { target: null, extraInstruction };
+				return parsed(null);
 		}
 	}
 
@@ -1316,6 +2329,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
+				return;
+			}
+
+			if (autoLoopRunning) {
+				ctx.ui.notify("Auto review is already running. Use /review-auto-stop to stop it.", "warning");
 				return;
 			}
 
@@ -1376,9 +2394,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				const messageCount = entries.filter((e) => e.type === "message").length;
 
 				// In an empty session, default to fresh review mode so /end-review works consistently.
-				let useFreshSession = messageCount === 0;
+				// Auto review always needs a review branch, so --auto forces fresh mode.
+				let useFreshSession = messageCount === 0 || Boolean(parsed.auto);
 
-				if (messageCount > 0) {
+				if (messageCount > 0 && !parsed.auto) {
 					// Existing session - ask user which mode they want
 					const choice = await ctx.ui.select("Start review in:", ["Empty branch", "Current session"]);
 
@@ -1392,6 +2411,65 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					}
 
 					useFreshSession = choice === "Empty branch";
+				}
+
+				let autoOptions: AutoReviewOptions | undefined;
+
+				if (parsed.auto) {
+					let reviewModel: ReviewModel | undefined;
+					if (parsed.auto.reviewModel) {
+						reviewModel = findModelByRef(ctx, parsed.auto.reviewModel);
+						if (!reviewModel) {
+							ctx.ui.notify(`Model not found: ${parsed.auto.reviewModel}`, "error");
+							return;
+						}
+					}
+					autoOptions = {
+						reviewModel,
+						maxRounds: parsed.auto.maxRounds ?? 5,
+						summary: parsed.auto.summary,
+						extraInstruction,
+					};
+				} else if (useFreshSession) {
+					const after = await ctx.ui.select("After the review:", [
+						"Review only (finish with /end-review)",
+						"Auto: fix findings and re-review until clean",
+					]);
+
+					if (after === undefined) {
+						if (fromSelector) {
+							target = null;
+							continue;
+						}
+						ctx.ui.notify("Review cancelled", "info");
+						return;
+					}
+
+					if (after.startsWith("Auto")) {
+						const modelChoice = await showAutoReviewModelSelector(ctx);
+						if (modelChoice === null) {
+							ctx.ui.notify("Review cancelled", "info");
+							return;
+						}
+
+						const maxRounds = await showAutoMaxRoundsSelector(ctx);
+						if (maxRounds === null) {
+							ctx.ui.notify("Review cancelled", "info");
+							return;
+						}
+
+						autoOptions = {
+							reviewModel: modelChoice.model,
+							maxRounds,
+							summary: false,
+							extraInstruction,
+						};
+					}
+				}
+
+				if (autoOptions) {
+					await runAutoReviewLoop(ctx, target, autoOptions);
+					return;
 				}
 
 				await executeReview(ctx, target, useFreshSession, { extraInstruction });
@@ -1598,6 +2676,10 @@ Instructions:
 			return;
 		}
 
+		if (autoLoopRunning) {
+			requestAutoStop(ctx);
+			return;
+		}
 
 		if (endReviewInProgress) {
 			ctx.ui.notify("/end-review is already running", "info");
@@ -1638,6 +2720,17 @@ Instructions:
 		description: "Complete review and return to original position",
 		handler: async (_args, ctx) => {
 			await runEndReview(ctx);
+		},
+	});
+
+	pi.registerCommand("review-auto-stop", {
+		description: "Stop the running auto review loop",
+		handler: async (_args, ctx) => {
+			if (!autoLoopRunning) {
+				ctx.ui.notify("No auto review is running.", "info");
+				return;
+			}
+			requestAutoStop(ctx);
 		},
 	});
 }
